@@ -1,220 +1,231 @@
 import { type NextRequest, NextResponse } from "next/server"
 import {
   searchPropertiesAdvanced,
-  getProperty,
-  getSalesComps,
-  getListingComps,
   mapToPropertyResult,
   type PropertySearchParams,
-  ALL_FIELDS,
 } from "@/lib/propertyradar"
+import { formatApiError, parseAddressQuery } from "@/lib/property-search-utils"
+import { getPropertyImagePath } from "@/lib/google-maps"
 
-const RENTCAST_API_KEY = process.env.RENTCAST_API_KEY
-const PROPERTYRADAR_API_KEY = process.env.PROPERTYRADAR_API_KEY
+const PROPERTY_API_KEY =
+  process.env.PROPERTYAPI_KEY || process.env.PROPERTY_API || process.env.PROPERTY_API_KEY
+const PROPERTY_API_BASE = "https://propertyapi.co/api/v1"
+const PROPERTY_API_HEADERS = {
+  "X-API-Key": PROPERTY_API_KEY || "",
+  Accept: "application/json",
+  "Content-Type": "application/json",
+}
+
+function hasPropertyRadarKey(): boolean {
+  return Boolean(
+    process.env.PROPERTYRADAR_API_KEY ||
+      process.env.PROPERTY_RADAR_API_TOKEN ||
+      process.env.PROPERTY_RADAR_API_KEY,
+  )
+}
+
+function buildSearchParams(body: Record<string, unknown>): PropertySearchParams {
+  const addressInput =
+    (body.address as string) ||
+    `${body.streetAddress || ""} ${body.city || ""} ${body.state || ""} ${body.zip || ""}`.trim()
+
+  const parsed = addressInput ? parseAddressQuery(addressInput) : null
+
+  const params: PropertySearchParams = {
+    state: (body.state as string) || parsed?.state || "CA",
+    city: (body.city as string) || parsed?.city,
+    zip: (body.zip as string) || parsed?.zip,
+    address: parsed?.address || (parsed?.hasStreetNumber ? addressInput : undefined),
+    limit: typeof body.limit === "number" ? body.limit : 20,
+    purchase: body.purchase === 0 ? 0 : 1,
+  }
+
+  if (body.propertyType) params.propertyType = body.propertyType as string
+  if (body.foreclosure) params.foreclosure = true
+  if (body.taxDelinquent) params.taxDelinquent = true
+  if (body.bankruptcy) params.bankruptcy = true
+  if (body.divorce) params.divorce = true
+  if (body.vacant) params.vacant = true
+  if (body.deceased) params.deceased = true
+  if (body.absenteeOwner) params.absenteeOwner = true
+  if (body.listedForSale) params.listedForSale = true
+  if (body.bedsMin) params.bedsMin = Number(body.bedsMin)
+  if (body.bedsMax) params.bedsMax = Number(body.bedsMax)
+  if (body.bathsMin) params.bathsMin = Number(body.bathsMin)
+  if (body.bathsMax) params.bathsMax = Number(body.bathsMax)
+  if (body.valueMin) params.valueMin = Number(body.valueMin)
+  if (body.valueMax) params.valueMax = Number(body.valueMax)
+  if (body.equityMin) params.equityMin = Number(body.equityMin)
+  if (body.equityMax) params.equityMax = Number(body.equityMax)
+  if (body.yearBuiltMin) params.yearBuiltMin = Number(body.yearBuiltMin)
+  if (body.yearBuiltMax) params.yearBuiltMax = Number(body.yearBuiltMax)
+
+  return params
+}
+
+async function searchPropertyRadar(params: PropertySearchParams) {
+  const { properties, resultCount } = await searchPropertiesAdvanced(params)
+  return {
+    source: "PropertyRadar" as const,
+    resultCount,
+    properties: properties.map(mapToPropertyResult),
+  }
+}
+
+async function searchPropertyApi(address: string) {
+  const detail = await papiPropertyDetail(address)
+  if (!detail) return null
+  return {
+    source: "PropertyAPI" as const,
+    resultCount: 1,
+    properties: [mapPapiProperty(detail)],
+  }
+}
 
 // -------------------------------------------------------
 // GET /api/property-search
-// Supports: source=propertyradar (default) | source=rentcast
 // -------------------------------------------------------
 export async function GET(request: NextRequest) {
   const sp = request.nextUrl.searchParams
-  const source = sp.get("source") || "propertyradar"
+  const address = sp.get("address")
 
-  // ---- PropertyRadar source (primary) ----
-  if (source === "propertyradar" && PROPERTYRADAR_API_KEY) {
-    return handlePropertyRadarSearch(sp)
+  if (!address) {
+    return NextResponse.json(
+      { error: "address query parameter is required (e.g., ?address=Los%20Angeles,%20CA)" },
+      { status: 400 },
+    )
   }
 
-  // ---- RentCast AVM fallback ----
-  return handleRentCastSearch(sp)
+  try {
+    if (hasPropertyRadarKey()) {
+      const params = buildSearchParams({ address, state: sp.get("state") || "CA" })
+      const radar = await searchPropertyRadar(params)
+      if (radar.properties.length > 0) return NextResponse.json(radar)
+    }
+
+    const parsed = parseAddressQuery(address)
+    if (parsed.hasStreetNumber && PROPERTY_API_KEY) {
+      const fallback = await searchPropertyApi(address)
+      if (fallback) return NextResponse.json(fallback)
+    }
+
+    return NextResponse.json(
+      { error: "No properties found for this location. Try a different city or full street address." },
+      { status: 404 },
+    )
+  } catch (error) {
+    console.error("Property search GET error:", error)
+    const msg = error instanceof Error ? error.message : "Property search failed"
+    return NextResponse.json({ error: formatApiError(msg) }, { status: 502 })
+  }
 }
 
 // -------------------------------------------------------
 // POST /api/property-search
-// Advanced PropertyRadar search with full filter body
+// PropertyRadar first, PropertyAPI fallback for street addresses
 // -------------------------------------------------------
 export async function POST(request: NextRequest) {
-  if (!PROPERTYRADAR_API_KEY) {
-    return NextResponse.json({ error: "PropertyRadar API key not configured" }, { status: 500 })
+  const body = await request.json()
+
+  const addressInput =
+    body.address ||
+    `${body.streetAddress || ""} ${body.city || ""} ${body.state || ""} ${body.zip || ""}`.trim()
+
+  if (!addressInput && !body.city && !body.zip) {
+    return NextResponse.json(
+      { error: "Enter a city, zip code, or address to search." },
+      { status: 400 },
+    )
   }
 
   try {
-    const body = await request.json()
-    const params: PropertySearchParams = {
-      state: body.state || undefined,
-      city: body.city || undefined,
-      zip: body.zip || undefined,
-      county: body.county || undefined,
-      address: body.address || undefined,
-      propertyType: body.propertyType || undefined,
-      bedsMin: body.bedsMin ?? undefined,
-      bedsMax: body.bedsMax ?? undefined,
-      bathsMin: body.bathsMin ?? undefined,
-      bathsMax: body.bathsMax ?? undefined,
-      yearBuiltMin: body.yearBuiltMin ?? undefined,
-      yearBuiltMax: body.yearBuiltMax ?? undefined,
-      valueMin: body.valueMin ?? undefined,
-      valueMax: body.valueMax ?? undefined,
-      equityMin: body.equityMin ?? undefined,
-      equityMax: body.equityMax ?? undefined,
-      foreclosure: body.foreclosure ?? undefined,
-      foreclosureStage: body.foreclosureStage || undefined,
-      taxDelinquent: body.taxDelinquent ?? undefined,
-      bankruptcy: body.bankruptcy ?? undefined,
-      divorce: body.divorce ?? undefined,
-      vacant: body.vacant ?? undefined,
-      deceased: body.deceased ?? undefined,
-      ownerOccupied: body.ownerOccupied ?? undefined,
-      absenteeOwner: body.absenteeOwner ?? undefined,
-      listedForSale: body.listedForSale ?? undefined,
-      limit: body.limit ?? 20,
-      purchase: body.purchase ?? 1,
-    }
+    // 1. PropertyRadar (primary)
+    if (hasPropertyRadarKey()) {
+      const params = buildSearchParams(body)
+      console.log("[property-search] PropertyRadar params:", JSON.stringify(params))
 
-    const { properties, resultCount } = await searchPropertiesAdvanced(params)
-    const mapped = properties.map(mapToPropertyResult)
-
-    return NextResponse.json({
-      source: "PropertyRadar",
-      resultCount,
-      properties: mapped,
-    })
-  } catch (error) {
-    console.error("PropertyRadar advanced search error:", error)
-    return NextResponse.json({ error: "PropertyRadar search failed" }, { status: 500 })
-  }
-}
-
-// -------------------------------------------------------
-// PropertyRadar GET handler
-// -------------------------------------------------------
-async function handlePropertyRadarSearch(sp: URLSearchParams) {
-  const action = sp.get("action")
-
-  // Single property detail by RadarID
-  if (action === "detail" && sp.get("radarId")) {
-    try {
-      const property = await getProperty(sp.get("radarId")!, ALL_FIELDS, 1)
-      if (!property) {
-        return NextResponse.json({ error: "Property not found" }, { status: 404 })
+      const radar = await searchPropertyRadar(params)
+      if (radar.properties.length > 0) {
+        return NextResponse.json(radar)
       }
-      return NextResponse.json({ source: "PropertyRadar", property: mapToPropertyResult(property) })
-    } catch (error) {
-      console.error("PropertyRadar detail error:", error)
-      return NextResponse.json({ error: "Property detail failed" }, { status: 500 })
-    }
-  }
-
-  // Sales comps
-  if (action === "comps-sales" && sp.get("radarId")) {
-    try {
-      const comps = await getSalesComps(sp.get("radarId")!, 0)
-      return NextResponse.json({ source: "PropertyRadar", comps: comps.map(mapToPropertyResult) })
-    } catch (error) {
-      return NextResponse.json({ error: "Comps lookup failed" }, { status: 500 })
-    }
-  }
-
-  // Listing comps
-  if (action === "comps-listings" && sp.get("radarId")) {
-    try {
-      const comps = await getListingComps(sp.get("radarId")!, 0)
-      return NextResponse.json({ source: "PropertyRadar", comps: comps.map(mapToPropertyResult) })
-    } catch (error) {
-      return NextResponse.json({ error: "Listing comps lookup failed" }, { status: 500 })
-    }
-  }
-
-  // Basic area search via GET params
-  const city = sp.get("city")
-  const state = sp.get("state")
-  const zip = sp.get("zip")
-  const address = sp.get("address")
-
-  if (!city && !state && !zip && !address) {
-    return NextResponse.json({ error: "At least city/state, zip, or address is required" }, { status: 400 })
-  }
-
-  try {
-    const params: PropertySearchParams = {
-      state: state || "CA",
-      city: city || undefined,
-      zip: zip || undefined,
-      address: address || undefined,
-      propertyType: sp.get("propertyType") || undefined,
-      foreclosure: sp.get("foreclosure") === "true" || undefined,
-      taxDelinquent: sp.get("taxDelinquent") === "true" || undefined,
-      bankruptcy: sp.get("bankruptcy") === "true" || undefined,
-      divorce: sp.get("divorce") === "true" || undefined,
-      vacant: sp.get("vacant") === "true" || undefined,
-      absenteeOwner: sp.get("absenteeOwner") === "true" || undefined,
-      limit: parseInt(sp.get("limit") || "20"),
-      purchase: 1,
     }
 
-    const { properties, resultCount } = await searchPropertiesAdvanced(params)
-    const mapped = properties.map(mapToPropertyResult)
+    // 2. PropertyAPI fallback for full street addresses
+    const parsed = parseAddressQuery(addressInput || "")
+    if (parsed.hasStreetNumber && PROPERTY_API_KEY) {
+      console.log("[property-search] PropertyAPI fallback for:", addressInput)
+      const fallback = await searchPropertyApi(addressInput)
+      if (fallback) return NextResponse.json(fallback)
+    }
 
-    return NextResponse.json({
-      source: "PropertyRadar",
-      resultCount,
-      properties: mapped,
-    })
+    return NextResponse.json(
+      {
+        error: parsed.hasStreetNumber
+          ? "No property found at this address. Try a different address or check spelling."
+          : "No properties found in this area. Try another city or add a state (e.g., Los Angeles, CA).",
+      },
+      { status: 404 },
+    )
   } catch (error) {
-    console.error("PropertyRadar search error:", error)
-    return NextResponse.json({ error: "PropertyRadar search failed" }, { status: 500 })
+    console.error("Property search POST error:", error)
+    const msg = error instanceof Error ? error.message : "Property search failed"
+    return NextResponse.json({ error: formatApiError(msg) }, { status: 502 })
   }
 }
 
-// -------------------------------------------------------
-// RentCast GET handler (AVM fallback)
-// -------------------------------------------------------
-async function handleRentCastSearch(sp: URLSearchParams) {
-  const address = sp.get("address")
-  const city = sp.get("city")
-  const state = sp.get("state")
-  const zip = sp.get("zip")
-
-  if (!RENTCAST_API_KEY) {
-    return NextResponse.json({ error: "No property search API configured" }, { status: 500 })
-  }
-
-  if (!address || !city || !state) {
-    return NextResponse.json({ error: "Address, city, and state are required for RentCast" }, { status: 400 })
-  }
-
-  const fullAddress = `${address}, ${city}, ${state}${zip ? `, ${zip}` : ""}`
-  let apiUrl = `https://api.rentcast.io/v1/avm/value?address=${encodeURIComponent(fullAddress)}&compCount=5`
-
-  const propertyType = sp.get("propertyType") || ""
-  const bedrooms = sp.get("bedrooms") || ""
-  const bathrooms = sp.get("bathrooms") || ""
-  const squareFootage = sp.get("squareFootage") || ""
-
-  if (propertyType) apiUrl += `&propertyType=${encodeURIComponent(propertyType)}`
-  if (bedrooms) apiUrl += `&bedrooms=${encodeURIComponent(bedrooms)}`
-  if (bathrooms) apiUrl += `&bathrooms=${encodeURIComponent(bathrooms)}`
-  if (squareFootage) apiUrl += `&squareFootage=${encodeURIComponent(squareFootage)}`
+async function papiPropertyDetail(address: string): Promise<Record<string, unknown> | null> {
+  if (!PROPERTY_API_KEY) return null
 
   try {
-    const response = await fetch(apiUrl, {
-      method: "GET",
-      headers: {
-        "X-Api-Key": RENTCAST_API_KEY,
-        Accept: "application/json",
-      },
-    })
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error("RentCast API error:", response.status, errorText)
-      return NextResponse.json({ error: `Property lookup failed: ${response.status}` }, { status: response.status })
+    const url = `${PROPERTY_API_BASE}/parcels/search-by-address?address=${encodeURIComponent(address)}`
+    console.log("[PropertyAPI] search-by-address request:", url)
+    const res = await fetch(url, { headers: PROPERTY_API_HEADERS })
+    if (!res.ok) {
+      const text = await res.text()
+      console.error("[PropertyAPI] search-by-address error", res.status, text)
+      return null
     }
 
-    const data = await response.json()
-    return NextResponse.json({ source: "RentCast", ...data })
+    const payload = await res.json()
+    if (!payload || payload.status !== "ok" || !payload.data) {
+      console.error("[PropertyAPI] unexpected response", payload)
+      return null
+    }
+
+    return payload.data
   } catch (error) {
-    console.error("Property search error:", error)
-    return NextResponse.json({ error: "Failed to fetch property data" }, { status: 500 })
+    console.error("[PropertyAPI] search-by-address error:", error)
+    return null
+  }
+}
+
+function mapPapiProperty(p: Record<string, unknown>) {
+  const result = {
+    address: (p.address || p.property_address || p.streetAddress || p.formattedAddress || "") as string,
+    city: (p.city || p.addr_city || "") as string,
+    state: (p.state || p.addr_state || "") as string,
+    zip: (p.zip || p.zipCode || p.zip_code || p.addr_zip || "") as string,
+    county: p.county as string | undefined,
+    latitude: (p.latitude || p.lat) as number | undefined,
+    longitude: (p.longitude || p.long) as number | undefined,
+    propertyType: (p.propertyType || p.property_type) as string | undefined,
+    beds: (p.bedrooms || p.beds) as number | undefined,
+    baths: (p.bathrooms || p.baths) as number | undefined,
+    sqft: (p.square_feet || p.squareFootage || p.sqft || p.livingArea) as number | undefined,
+    lotSize: (p.lot_size || p.lotSize || p.lotAcres) as number | undefined,
+    yearBuilt: (p.yearBuilt || p.year_built) as number | undefined,
+    value: (p.estimatedValue || p.avm || p.assessedValue || p.marketValue) as number | undefined,
+    equity: p.equity as number | undefined,
+    ownerName: (p.ownerName || p.owner) as string | undefined,
+    ownerAddress: (p.mailingAddress || p.ownerMailingAddress || p.mailing_address) as string | undefined,
+    lastSaleDate: (p.lastSaleDate || p.saleDate) as string | undefined,
+    lastSalePrice: (p.lastSalePrice || p.salePrice) as number | undefined,
+    apn: (p.apn || p.parcelNumber || p.apn_unformatted) as string | undefined,
+    source: "PropertyAPI",
+  }
+
+  return {
+    ...result,
+    imageUrl: getPropertyImagePath(result),
   }
 }
